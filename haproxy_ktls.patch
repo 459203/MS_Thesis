@@ -1,0 +1,463 @@
+--- ssl_sock.c	2018-01-16 16:08:47.833926604 +0100
++++ ssl_sock_ktls_splice_ssl.c	2018-01-16 16:02:59.140942433 +0100
+@@ -46,6 +46,8 @@
+ #include <openssl/x509.h>
+ #include <openssl/err.h>
+ #include <openssl/rand.h>
++#include <openssl/aes.h>
++#include <openssl/modes.h>
+ #if (defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP)
+ #include <openssl/ocsp.h>
+ #endif
+@@ -95,6 +97,9 @@
+ #include <proto/ssl_sock.h>
+ #include <proto/stream.h>
+ #include <proto/task.h>
++#include <proto/pipe.h>
++#include "ssl_sock.h"
++#include "af_ktls.h"
+ 
+ /* Warning, these are bits, not integers! */
+ #define SSL_SOCK_ST_FL_VERIFY_DONE  0x00000001
+@@ -3347,6 +3352,109 @@
+ 	bind_conf->ca_sign_cert = NULL;
+ }
+ 
++static int opfd;
++
++int ktls_init(int origfd, SSL* ssl){
++	struct sockaddr_ktls sa = { .sa_cipher = KTLS_CIPHER_AES_GCM_128,
++            .sa_socket = origfd, .sa_version = KTLS_VERSION_1_2};
++
++    int sock = socket(AF_KTLS, SOCK_STREAM, 0);
++    if (sock < 0) {
++        perror("AF_ALG: create socket failed\n");
++        exit(EXIT_FAILURE);
++    }
++
++    if (bind(sock, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
++        perror("AF_ALG: bind failed\n");
++        exit(EXIT_FAILURE);
++    }
++    ktls_attach(sock, origfd, ssl);
++
++    return sock;
++}
++
++int ktls_attach(int sock, int origfd, SSL *ssl) {
++    EVP_CIPHER_CTX * writeCtx = ssl->enc_write_ctx;
++    EVP_CIPHER_CTX * readCtx = ssl->enc_read_ctx;
++
++    EVP_AES_GCM_CTX* data = 1;
++    EVP_AES_GCM_CTX* gcmWrite = (EVP_AES_GCM_CTX*) (writeCtx->cipher_data);
++    EVP_AES_GCM_CTX* gcmRead = (EVP_AES_GCM_CTX*) (readCtx->cipher_data);
++
++    unsigned char* writeKey = (unsigned char*) (gcmWrite->gcm.key);
++    unsigned char* readKey = (unsigned char*) (gcmRead->gcm.key);
++
++    unsigned char* writeIV = gcmWrite->iv;
++    unsigned char* readIV = gcmRead->iv;
++
++    if (setsockopt(sock, AF_KTLS, KTLS_SET_KEY_SEND, writeKey, 16)) {
++        perror("AF_ALG: set write key failed\n");
++        exit(EXIT_FAILURE);
++    }
++
++    if (setsockopt(sock, AF_KTLS, KTLS_SET_KEY_RECV, readKey, 16)) {
++        perror("AF_ALG: set read key failed\n");
++        exit(EXIT_FAILURE);
++    }
++
++    if (setsockopt(sock, AF_KTLS, KTLS_SET_SALT_SEND, writeIV, 4)) {
++        perror("AF_ALG: set write key failed\n");
++        exit(EXIT_FAILURE);
++    }
++
++    if (setsockopt(sock, AF_KTLS, KTLS_SET_SALT_RECV, readIV, 4)) {
++        perror("AF_ALG: set read key failed\n");
++        exit(EXIT_FAILURE);
++    }
++    unsigned char* writeSeqNum = ssl->s3->write_sequence;
++
++    if (setsockopt(sock, AF_KTLS, KTLS_SET_IV_SEND, writeSeqNum, 8)) {
++        perror("AF_ALG: set write key failed\n");
++        exit(EXIT_FAILURE);
++    }
++
++    unsigned char* readSeqNum = ssl->s3->read_sequence;
++
++    if (setsockopt(sock, AF_KTLS, KTLS_SET_IV_RECV, readSeqNum, 8)) {
++        perror("AF_ALG: set read key failed\n");
++        exit(EXIT_FAILURE);
++    }
++    //fcntl(sock, F_SETFL, O_NONBLOCK);
++    return 0;
++
++}
++
++int resetKeys(int sock, SSL *ssl) {
++    EVP_CIPHER_CTX * writeCtx = ssl->enc_write_ctx;
++    EVP_CIPHER_CTX * readCtx = ssl->enc_read_ctx;
++
++    EVP_AES_GCM_CTX* gcmWrite = (EVP_AES_GCM_CTX*)(writeCtx->cipher_data);
++    EVP_AES_GCM_CTX* gcmRead = (EVP_AES_GCM_CTX*)(readCtx->cipher_data);
++
++    unsigned char* writeKey = (unsigned char*)(gcmWrite->gcm.key);
++    unsigned char* readKey = (unsigned char*)(gcmRead->gcm.key);
++
++    unsigned char* writeIV = gcmWrite->iv;
++    unsigned char* readIV = gcmRead->iv;
++
++    unsigned char* readSeqNum = ssl->s3->read_sequence;
++
++    unsigned char* writeSeqNum = ssl->s3->write_sequence;
++    int err = 0;
++    socklen_t optlen = 8;
++    err = getsockopt(sock, AF_KTLS, KTLS_GET_IV_RECV, readSeqNum, &optlen);
++    if (err < 0) {
++      perror("failed to get send key on AF_KTLS socket using setsockopt(2)");
++    }
++
++    err = getsockopt(sock, AF_KTLS, KTLS_GET_IV_SEND, writeSeqNum, &optlen);
++    if (err < 0) {
++      perror("failed to get send key on AF_KTLS socket using setsockopt(2)");
++    }
++    close(sock);
++    return 0;
++}
++
+ /*
+  * This function is called if SSL * context is not yet allocated. The function
+  * is designed to be called before any other data-layer operation and sets the
+@@ -3418,7 +3526,7 @@
+ 
+ 		/* leave init state and start handshake */
+ 		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN;
+-
++	
+ 		sslconns++;
+ 		totalsslconns++;
+ 		return 0;
+@@ -3656,6 +3764,7 @@
+ 		}
+ 	}
+ 
++
+ reneg_ok:
+ 	/* Handshake succeeded */
+ 	if (!SSL_session_reused(conn->xprt_ctx)) {
+@@ -3682,6 +3791,7 @@
+ 
+ 	/* The connection is now established at both layers, it's time to leave */
+ 	conn->flags &= ~(flag | CO_FL_WAIT_L4_CONN | CO_FL_WAIT_L6_CONN);
++	
+ 	return 1;
+ 
+  out_error:
+@@ -3714,17 +3824,17 @@
+ {
+ 	int ret, done = 0;
+ 	int try;
+-
++	
+ 	if (!conn->xprt_ctx)
+-		goto out_error;
+-
+-	if (conn->flags & CO_FL_HANDSHAKE)
+-		/* a handshake was requested */
+-		return 0;
++                goto out_error;
+ 
+-	/* let's realign the buffer to optimize I/O */
+-	if (buffer_empty(buf))
+-		buf->p = buf->data;
++        if (conn->flags & CO_FL_HANDSHAKE)
++                /* a handshake was requested */
++                return 0;
++
++        /* let's realign the buffer to optimize I/O */
++        if (buffer_empty(buf))
++                buf->p = buf->data;
+ 
+ 	/* read the largest possible block. For this, we perform only one call
+ 	 * to recv() unless the buffer wraps and we exactly fill the first hunk,
+@@ -3745,52 +3855,52 @@
+ 
+ 		ret = SSL_read(conn->xprt_ctx, bi_end(buf), try);
+ 		if (conn->flags & CO_FL_ERROR) {
+-			/* CO_FL_ERROR may be set by ssl_sock_infocbk */
+-			goto out_error;
+-		}
+-		if (ret > 0) {
+-			buf->i += ret;
+-			done += ret;
+-			if (ret < try)
+-				break;
+-			count -= ret;
+-		}
+-		else if (ret == 0) {
+-			ret =  SSL_get_error(conn->xprt_ctx, ret);
+-			if (ret != SSL_ERROR_ZERO_RETURN) {
+-				/* error on protocol or underlying transport */
+-				if ((ret != SSL_ERROR_SYSCALL)
+-				     || (errno && (errno != EAGAIN)))
+-					conn->flags |= CO_FL_ERROR;
+-
+-				/* Clear openssl global errors stack */
+-				ssl_sock_dump_errors(conn);
+-				ERR_clear_error();
+-			}
+-			goto read0;
+-		}
++                        /* CO_FL_ERROR may be set by ssl_sock_infocbk */
++                        goto out_error;
++                }
++                if (ret > 0) {
++                        buf->i += ret;
++                        done += ret;
++                        if (ret < try)
++                                break;
++                        count -= ret;
++                }
++                else if (ret == 0) {
++                        ret =  SSL_get_error(conn->xprt_ctx, ret);
++                        if (ret != SSL_ERROR_ZERO_RETURN) {
++                                /* error on protocol or underlying transport */
++                                if ((ret != SSL_ERROR_SYSCALL)
++                                     || (errno && (errno != EAGAIN)))
++                                        conn->flags |= CO_FL_ERROR;
++
++                                /* Clear openssl global errors stack */
++                                ssl_sock_dump_errors(conn);
++                                ERR_clear_error();
++                        }
++                        goto read0;
++                }
+ 		else {
+-			ret =  SSL_get_error(conn->xprt_ctx, ret);
+-			if (ret == SSL_ERROR_WANT_WRITE) {
+-				/* handshake is running, and it needs to enable write */
+-				conn->flags |= CO_FL_SSL_WAIT_HS;
+-				__conn_sock_want_send(conn);
+-				break;
+-			}
+-			else if (ret == SSL_ERROR_WANT_READ) {
+-				if (SSL_renegotiate_pending(conn->xprt_ctx)) {
+-					/* handshake is running, and it may need to re-enable read */
+-					conn->flags |= CO_FL_SSL_WAIT_HS;
+-					__conn_sock_want_recv(conn);
+-					break;
+-				}
+-				/* we need to poll for retry a read later */
+-				fd_cant_recv(conn->t.sock.fd);
+-				break;
+-			}
+-			/* otherwise it's a real error */
+-			goto out_error;
+-		}
++                        ret =  SSL_get_error(conn->xprt_ctx, ret);
++                        if (ret == SSL_ERROR_WANT_WRITE) {
++                                /* handshake is running, and it needs to enable write */
++                                conn->flags |= CO_FL_SSL_WAIT_HS;
++                                __conn_sock_want_send(conn);
++                                break;
++                        }
++                        else if (ret == SSL_ERROR_WANT_READ) {
++                                if (SSL_renegotiate_pending(conn->xprt_ctx)) {
++                                        /* handshake is running, and it may need to re-enable read */
++                                        conn->flags |= CO_FL_SSL_WAIT_HS;
++                                        __conn_sock_want_recv(conn);
++                                        break;
++                                }
++                                /* we need to poll for retry a read later */
++                                fd_cant_recv(conn->t.sock.fd);
++                                break;
++                        }
++                        /* otherwise it's a real error */
++                        goto out_error;
++                }
+ 	}
+ 	return done;
+ 
+@@ -3824,11 +3934,13 @@
+ 	done = 0;
+ 
+ 	if (!conn->xprt_ctx)
+-		goto out_error;
++                goto out_error;
+ 
+-	if (conn->flags & CO_FL_HANDSHAKE)
+-		/* a handshake was requested */
+-		return 0;
++        if (conn->flags & CO_FL_HANDSHAKE)
++                /* a handshake was requested */
++                return 0;
++
++	opfd = ktls_init(conn->t.sock.fd, conn->xprt_ctx);
+ 
+ 	/* send the largest possible block. For this we perform only one call
+ 	 * to send() unless the buffer wraps and we exactly fill the first hunk,
+@@ -3850,12 +3962,12 @@
+ 			conn->xprt_st |= SSL_SOCK_SEND_UNLIMITED;
+ 		}
+ 
+-		ret = SSL_write(conn->xprt_ctx, bo_ptr(buf), try);
+-
++		write(opfd, bo_ptr(buf), try);
+ 		if (conn->flags & CO_FL_ERROR) {
+-			/* CO_FL_ERROR may be set by ssl_sock_infocbk */
+-			goto out_error;
+-		}
++                        /* CO_FL_ERROR may be set by ssl_sock_infocbk */
++                        goto out_error;
++                }
++
+ 		if (ret > 0) {
+ 			conn->xprt_st &= ~SSL_SOCK_SEND_UNLIMITED;
+ 
+@@ -3871,25 +3983,21 @@
+ 				break;
+ 		}
+ 		else {
+-			ret = SSL_get_error(conn->xprt_ctx, ret);
+-			if (ret == SSL_ERROR_WANT_WRITE) {
+-				if (SSL_renegotiate_pending(conn->xprt_ctx)) {
+-					/* handshake is running, and it may need to re-enable write */
+-					conn->flags |= CO_FL_SSL_WAIT_HS;
+-					__conn_sock_want_send(conn);
+-					break;
+-				}
+ 				/* we need to poll to retry a write later */
++				if (SSL_renegotiate_pending(conn->xprt_ctx)) {
++					resetKeys(opfd, conn->xprt_ctx);
++                                        /* handshake is running, and it may need to re-enable write */
++                                        conn->flags |= CO_FL_SSL_WAIT_HS;
++                                        __conn_sock_want_send(conn);
++                                        break;
++                                
++				resetKeys(opfd, conn->xprt_ctx);
+ 				fd_cant_send(conn->t.sock.fd);
+ 				break;
+-			}
+-			else if (ret == SSL_ERROR_WANT_READ) {
+-				/* handshake is running, and it needs to enable read */
+-				conn->flags |= CO_FL_SSL_WAIT_HS;
+-				__conn_sock_want_recv(conn);
+-				break;
+-			}
+-			goto out_error;
++
++                        }
++                        goto out_error;
++				//goto out_error;
+ 		}
+ 	}
+ 	return done;
+@@ -3903,9 +4011,94 @@
+ 	return done;
+ }
+ 
++#if defined(CONFIG_HAP_LINUX_SPLICE)
++#include <common/splice.h>
++
++#define SPLICE_FULL_HINT        16*1448
++
++/* how many data we attempt to splice at once when the buffer is configured for
++ * infinite forwarding */
++#define MAX_SPLICE_AT_ONCE      (1<<30)
++
++int ssl_sock_from_pipe(struct connection *conn, struct pipe *pipe, int flags)
++{
++
++	int ret, try, done;
++
++        done = 0;
++
++        if (!conn->xprt_ctx)
++                goto out_error;
++
++        if (conn->flags & CO_FL_HANDSHAKE)
++                /* a handshake was requested */
++                return 0;
++
++        opfd = ktls_init(conn->t.sock.fd, conn->xprt_ctx);
++
++        /* send the largest possible block. For this we perform only one call
++         * to send() unless the buffer wraps and we exactly fill the first hunk,
++         * in which case we accept to do it once again.
++         */
++        while (pipe->data) {
++                try = pipe->data;
++
++                if (!(flags & CO_SFL_STREAMER) &&
++                    !(conn->xprt_st & SSL_SOCK_SEND_UNLIMITED) &&
++                    global.tune.ssl_max_record && try > global.tune.ssl_max_record) {
++                        try = global.tune.ssl_max_record;
++                }
++                else {
++                        conn->xprt_st |= SSL_SOCK_SEND_UNLIMITED;
++                }
++
++                splice(pipe->cons, NULL, opfd, NULL, pipe->data,
++                             SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
++		if (conn->flags & CO_FL_ERROR) {
++                        /* CO_FL_ERROR may be set by ssl_sock_infocbk */
++                        goto out_error;
++                }
++
++                if (ret > 0) {
++                        conn->xprt_st &= ~SSL_SOCK_SEND_UNLIMITED;
++
++			done += ret;
++                	pipe->data -= ret;
++
++                }
++                else {
++                                /* we need to poll to retry a write later */
++                                if (SSL_renegotiate_pending(conn->xprt_ctx)) {
++                                        resetKeys(opfd, conn->xprt_ctx);
++                                        /* handshake is running, and it may need to re-enable write */
++                                        conn->flags |= CO_FL_SSL_WAIT_HS;
++                                        __conn_sock_want_send(conn);
++                                        break;
++                                }
++                                resetKeys(opfd, conn->xprt_ctx);
++                                fd_cant_send(conn->t.sock.fd);
++                                break;
++                                goto out_error;
++                }
++        }
++	return done;
++
++ out_error:
++        /* Clear openssl global errors stack */
++        ssl_sock_dump_errors(conn);
++        ERR_clear_error();
++
++        conn->flags |= CO_FL_ERROR;
++        return done;
++}
++#endif
++
+ static void ssl_sock_close(struct connection *conn) {
+ 
+-	if (conn->xprt_ctx) {
++	if (conn->xprt_ctx) {	
++	if (setsockopt(opfd, AF_KTLS, KTLS_UNATTACH, 0, 0)) {
++        	perror("unattach failed\n");
++    	}
+ 		SSL_free(conn->xprt_ctx);
+ 		conn->xprt_ctx = NULL;
+ 		sslconns--;
+@@ -6414,8 +6607,10 @@
+ struct xprt_ops ssl_sock = {
+ 	.snd_buf  = ssl_sock_from_buf,
+ 	.rcv_buf  = ssl_sock_to_buf,
++	#if defined(CONFIG_HAP_LINUX_SPLICE)
+ 	.rcv_pipe = NULL,
+-	.snd_pipe = NULL,
++	.snd_pipe = ssl_sock_from_pipe,
++	#endif
+ 	.shutr    = NULL,
+ 	.shutw    = ssl_sock_shutw,
+ 	.close    = ssl_sock_close,
